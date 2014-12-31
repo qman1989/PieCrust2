@@ -2,7 +2,6 @@ import re
 import time
 import os.path
 import logging
-import threading
 import strict_rfc3339
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 from jinja2.exceptions import TemplateSyntaxError
@@ -316,7 +315,6 @@ class PieCrustCacheExtension(Extension):
 
     def __init__(self, environment):
         super(PieCrustCacheExtension, self).__init__(environment)
-        self._lock = threading.RLock()
 
         environment.extend(
             piecrust_cache_prefix='',
@@ -357,18 +355,12 @@ class PieCrustCacheExtension(Extension):
             render_ctx.used_source_names.update(pair[1])
             return pair[0]
 
-        with self._lock:
-            pair = self.environment.piecrust_cache.get(key)
-            if pair is not None:
-                render_ctx.used_source_names.update(pair[1])
-                return pair[0]
-
-            prev_used = render_ctx.used_source_names.copy()
-            rv = caller()
-            after_used = render_ctx.used_source_names.copy()
-            used_delta = after_used.difference(prev_used)
-            self.environment.piecrust_cache[key] = (rv, used_delta)
-            return rv
+        prev_used = render_ctx.used_source_names.copy()
+        rv = caller()
+        after_used = render_ctx.used_source_names.copy()
+        used_delta = after_used.difference(prev_used)
+        self.environment.piecrust_cache[key] = (rv, used_delta)
+        return rv
 
 
 class PieCrustSpacelessExtension(HtmlCompressor):

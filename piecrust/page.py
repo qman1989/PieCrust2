@@ -255,9 +255,11 @@ def _do_load_page(app, path, path_mtime):
     cache_path = "%s.json" % rel_path.replace('/', '_').strip('_')
     page_time = path_mtime or os.path.getmtime(path)
     if cache.isValid(cache_path, page_time):
-        cache_data = json.loads(cache.read(cache_path),
+        cache_data = json.loads(
+                cache.read(cache_path),
                 object_pairs_hook=collections.OrderedDict)
-        config = PageConfiguration(values=cache_data['config'],
+        config = PageConfiguration(
+                values=cache_data['config'],
                 validate=False)
         content = json_load_segments(cache_data['content'])
         return config, content, True
@@ -268,7 +270,7 @@ def _do_load_page(app, path, path_mtime):
         raw = fp.read()
     header, offset = parse_config_header(raw)
 
-    if not 'format' in header:
+    if 'format' not in header:
         auto_formats = app.config.get('site/auto_formats')
         name, ext = os.path.splitext(path)
         header['format'] = auto_formats.get(ext, None)

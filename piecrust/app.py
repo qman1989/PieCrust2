@@ -36,10 +36,12 @@ class VariantNotFoundError(Exception):
 
 
 class PieCrustConfiguration(Configuration):
-    def __init__(self, paths=None, cache=None, values=None, validate=True):
+    def __init__(self, paths=None, cache=None, values=None, validate=True,
+                 accept_uncached=True):
         super(PieCrustConfiguration, self).__init__(values, validate)
         self.paths = paths
         self.cache = cache or NullCache()
+        self.accept_uncached = accept_uncached
         self.fixups = []
 
     def applyVariant(self, variant_path, raise_if_not_found=True):
@@ -75,6 +77,9 @@ class PieCrustConfiguration(Configuration):
                 return
             logger.debug("Outdated cache key '%s' (expected '%s')." % (
                     actual_cache_key, cache_key))
+
+        if not self.accept_uncached:
+            raise Exception("Expected cached configuration.")
 
         values = {}
         logger.debug("Loading configuration from: %s" % self.paths)
@@ -389,7 +394,9 @@ class PieCrust(object):
         paths.append(os.path.join(self.root_dir, CONFIG_PATH))
 
         config_cache = self.cache.getCache('app')
-        config = PieCrustConfiguration(paths, config_cache)
+        config = PieCrustConfiguration(
+                paths, config_cache,
+                accept_uncached=self.env.accept_uncached_data)
         if self.theme_dir:
             # We'll need to patch the templates directories to be relative
             # to the site's root, and not the theme root.

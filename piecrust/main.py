@@ -7,35 +7,15 @@ import argparse
 import colorama
 from piecrust import APP_VERSION
 from piecrust.app import PieCrust, PieCrustConfiguration
-from piecrust.chefutil import (format_timed, log_friendly_exception,
+from piecrust.chefutil import (
+        setup_logging, format_timed, log_friendly_exception,
         print_help_item)
 from piecrust.commands.base import CommandContext
-from piecrust.environment import StandardEnvironment
 from piecrust.pathutil import SiteNotFoundError, find_app_root
 from piecrust.plugins.base import PluginLoader
 
 
 logger = logging.getLogger(__name__)
-
-
-class ColoredFormatter(logging.Formatter):
-    COLORS = {
-            'DEBUG': colorama.Fore.BLACK + colorama.Style.BRIGHT,
-            'INFO': '',
-            'WARNING': colorama.Fore.YELLOW,
-            'ERROR': colorama.Fore.RED,
-            'CRITICAL': colorama.Back.RED + colorama.Fore.WHITE
-            }
-
-    def __init__(self, fmt=None, datefmt=None):
-        super(ColoredFormatter, self).__init__(fmt, datefmt)
-
-    def format(self, record):
-        color = self.COLORS.get(record.levelname)
-        res = super(ColoredFormatter, self).format(record)
-        if color:
-            res = color + res + colorama.Style.RESET_ALL
-        return res
 
 
 class NullPieCrust:
@@ -53,7 +33,7 @@ class NullPieCrust:
 
 def main():
     argv = sys.argv
-    pre_args = _pre_parse_chef_args(argv)
+    pre_args = pre_parse_chef_args(argv)
     try:
         exit_code = _run_chef(pre_args)
     except Exception as ex:
@@ -67,7 +47,7 @@ def main():
 
 class PreParsedChefArgs(object):
     def __init__(self, root=None, cache=True, debug=False, quiet=False,
-            log_file=None, log_debug=False, config_variant=None):
+                 log_file=None, log_debug=False, config_variant=None):
         self.root = root
         self.cache = cache
         self.debug = debug
@@ -77,7 +57,7 @@ class PreParsedChefArgs(object):
         self.config_variant = config_variant
 
 
-def _pre_parse_chef_args(argv):
+def pre_parse_chef_args(argv):
     # We need to parse some arguments before we can build the actual argument
     # parser, because it can affect which plugins will be loaded. Also, log-
     # related arguments must be parsed first because we want to log everything
@@ -118,28 +98,7 @@ def _pre_parse_chef_args(argv):
         raise Exception("You can't specify both --debug and --quiet.")
 
     colorama.init()
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    if res.debug or res.log_debug:
-        root_logger.setLevel(logging.DEBUG)
-
-    log_handler = logging.StreamHandler(sys.stdout)
-    if res.debug:
-        log_handler.setLevel(logging.DEBUG)
-        log_handler.setFormatter(ColoredFormatter("[%(name)s] %(message)s"))
-    else:
-        if res.quiet:
-            log_handler.setLevel(logging.WARNING)
-        else:
-            log_handler.setLevel(logging.INFO)
-        log_handler.setFormatter(ColoredFormatter("%(message)s"))
-    root_logger.addHandler(log_handler)
-
-    if res.log_file:
-        file_handler = logging.FileHandler(res.log_file, mode='w')
-        root_logger.addHandler(file_handler)
-        if res.log_debug:
-            file_handler.setLevel(logging.DEBUG)
+    setup_logging(res.quiet, res.debug, res.log_file, res.log_debug)
 
     return res
 

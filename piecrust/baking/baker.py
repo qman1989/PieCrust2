@@ -1,15 +1,16 @@
 import time
 import os.path
+import queue
 import shutil
 import hashlib
 import logging
-import threading
-from piecrust.baking.records import (TransitionalBakeRecord,
-        BakeRecordPageEntry)
-from piecrust.baking.scheduler import BakeScheduler
-from piecrust.baking.single import (BakingError, PageBaker)
-from piecrust.chefutil import format_timed, log_friendly_exception
-from piecrust.sources.base import (PageFactory,
+import multiprocessing
+from piecrust.baking.records import TransitionalBakeRecord
+from piecrust.baking.worker import (
+        BakeWorkerContext, BakeWorkerJob, run_worker)
+from piecrust.chefutil import format_timed
+from piecrust.sources.base import (
+        PageFactory,
         REALM_NAMES, REALM_USER, REALM_THEME)
 
 
@@ -18,14 +19,14 @@ logger = logging.getLogger(__name__)
 
 class Baker(object):
     def __init__(self, app, out_dir, force=False, portable=False,
-            no_assets=False, num_workers=4):
+                 no_assets=False, num_workers=None):
         assert app and out_dir
         self.app = app
         self.out_dir = out_dir
         self.force = force
         self.portable = portable
         self.no_assets = no_assets
-        self.num_workers = num_workers
+        self.num_workers = num_workers or min(2, multiprocessing.cpu_count())
 
         # Remember what taxonomy pages we should skip
         # (we'll bake them repeatedly later with each taxonomy term)
@@ -61,29 +62,37 @@ class Baker(object):
             t = time.clock()
             record.loadPrevious(record_cache.getCachePath(record_name))
             logger.debug(format_timed(t, 'loaded previous bake record',
-                colored=False));
+                                      colored=False))
 
         # Figure out if we need to clean the cache because important things
         # have changed.
         self._handleCacheValidity(record)
 
-        # Gather all sources by realm -- we're going to bake each realm
-        # separately so we can handle "overlaying" (i.e. one realm overrides
-        # another realm's pages).
-        sources_by_realm = {}
-        for source in self.app.sources:
-            srclist = sources_by_realm.setdefault(source.realm, [])
-            srclist.append(source)
+        # Pre-create the file-system caches.
+        for n in ['app', 'pages', 'renders', 'baker', 'proc']:
+            self.app.cache.getCache(n)
 
-        # Bake the realms.
-        realm_list = [REALM_USER, REALM_THEME]
-        for realm in realm_list:
-            srclist = sources_by_realm.get(realm)
-            if srclist is not None:
-                self._bakeRealm(record, realm, srclist)
+        # Create the bake context (worker pool, job queue, etc.).
+        # This will start the worker processes.
+        bake_ctx = self._createBakeContext(record)
+        with bake_ctx:
+            # Gather all sources by realm -- we're going to bake each realm
+            # separately so we can handle "overlaying" (i.e. one realm
+            # overrides another realm's pages).
+            sources_by_realm = {}
+            for source in self.app.sources:
+                srclist = sources_by_realm.setdefault(source.realm, [])
+                srclist.append(source)
 
-        # Bake taxonomies.
-        self._bakeTaxonomies(record)
+            # Bake the realms.
+            realm_list = [REALM_USER, REALM_THEME]
+            for realm in realm_list:
+                srclist = sources_by_realm.get(realm)
+                if srclist is not None:
+                    self._bakeRealm(bake_ctx, realm, srclist)
+
+            # Bake taxonomies.
+            self._bakeTaxonomies(bake_ctx)
 
         # Delete files from the output.
         self._handleDeletetions(record)
@@ -98,7 +107,7 @@ class Baker(object):
 
         # All done.
         self.app.config.set('baker/is_baking', False)
-        logger.debug(format_timed(start_time, 'done baking'))
+        logger.info(format_timed(start_time, 'done baking'))
 
     def _handleCacheValidity(self, record):
         start_time = time.clock()
@@ -139,41 +148,32 @@ class Baker(object):
             record.incremental_count = 0
             record.clearPrevious()
             logger.info(format_timed(start_time,
-                "cleaned cache (reason: %s)" % reason))
+                                     "cleaned cache (reason: %s)" % reason))
         else:
             record.incremental_count += 1
             logger.debug(format_timed(start_time, "cache is assumed valid",
-                colored=False))
+                                      colored=False))
 
-    def _bakeRealm(self, record, realm, srclist):
+    def _bakeRealm(self, bake_ctx, realm, srclist):
         # Gather all page factories from the sources and queue them
         # for the workers to pick up. Just skip taxonomy pages for now.
         logger.debug("Baking realm %s" % REALM_NAMES[realm])
-        pool, queue, abort = self._createWorkerPool(record, self.num_workers)
-
+        jobs = []
         for source in srclist:
             factories = source.getPageFactories()
             for fac in factories:
                 if fac.path in self.taxonomy_pages:
-                    logger.debug("Skipping taxonomy page: %s:%s" %
+                    logger.debug(
+                            "Skipping taxonomy page: %s:%s" %
                             (source.name, fac.ref_spec))
                     continue
 
-                entry = BakeRecordPageEntry(fac)
-                record.addEntry(entry)
-
                 route = self.app.getRoute(source.name, fac.metadata)
-                if route is None:
-                    entry.errors.append("Can't get route for page: %s" %
-                            fac.ref_spec)
-                    logger.error(entry.errors[-1])
-                    continue
+                jobs.append(BakeWorkerJob(fac, route))
 
-                queue.addJob(BakeWorkerJob(fac, route, entry))
+        self._runJobs(bake_ctx, jobs)
 
-        self._waitOnWorkerPool(pool, abort)
-
-    def _bakeTaxonomies(self, record):
+    def _bakeTaxonomies(self, bake_ctx):
         logger.debug("Baking taxonomies")
 
         # Let's see all the taxonomy terms for which we must bake a
@@ -189,7 +189,7 @@ class Baker(object):
 
         # Now see which ones are 'dirty' based on our bake record.
         logger.debug("Gathering dirty taxonomy terms")
-        for prev_entry, cur_entry in record.transitions.values():
+        for prev_entry, cur_entry in bake_ctx.record.transitions.values():
             for tax in self.app.taxonomies:
                 changed_terms = None
                 # Re-bake all taxonomy pages that include new or changed
@@ -221,7 +221,7 @@ class Baker(object):
         # Re-bake the combination pages for terms that are 'dirty'.
         known_combinations = set()
         logger.debug("Gathering dirty term combinations")
-        for prev_entry, cur_entry in record.transitions.values():
+        for prev_entry, cur_entry in bake_ctx.record.transitions.values():
             if cur_entry:
                 known_combinations |= cur_entry.used_taxonomy_terms
             elif prev_entry:
@@ -232,38 +232,41 @@ class Baker(object):
                 changed_terms.add(terms)
 
         # Start baking those terms.
-        pool, queue, abort = self._createWorkerPool(record, self.num_workers)
+        jobs = []
         for source_name, source_taxonomies in buckets.items():
             for tax_name, terms in source_taxonomies.items():
                 if len(terms) == 0:
                     continue
 
-                logger.debug("Baking '%s' for source '%s': %s" %
+                logger.debug(
+                        "Baking '%s' for source '%s': %s" %
                         (tax_name, source_name, terms))
                 tax = self.app.getTaxonomy(tax_name)
-                route = self.app.getTaxonomyRoute(tax_name, source_name)
                 tax_page_ref = tax.getPageRef(source_name)
                 if not tax_page_ref.exists:
-                    logger.debug("No taxonomy page found at '%s', skipping." %
+                    logger.debug(
+                            "No taxonomy page found at '%s', skipping." %
                             tax.page_ref)
                     continue
 
                 tax_page_source = tax_page_ref.source
                 tax_page_rel_path = tax_page_ref.rel_path
-                logger.debug("Using taxonomy page: %s:%s" %
+                route = self.app.getTaxonomyRoute(tax_name, source_name)
+                logger.debug(
+                        "Using taxonomy page: %s:%s" %
                         (tax_page_source.name, tax_page_rel_path))
 
                 for term in terms:
-                    fac = PageFactory(tax_page_source, tax_page_rel_path,
+                    fac = PageFactory(
+                            tax_page_source, tax_page_rel_path,
                             {tax.term_name: term})
-                    logger.debug("Queuing: %s [%s, %s]" %
+                    logger.debug(
+                            "Queuing: %s [%s, %s]" %
                             (fac.ref_spec, tax_name, term))
-                    entry = BakeRecordPageEntry(fac, tax_name, term)
-                    record.addEntry(entry)
-                    queue.addJob(
-                            BakeWorkerJob(fac, route, entry, tax_name, term))
+                    jobs.append(
+                            BakeWorkerJob(fac, route, tax_name, term))
 
-        self._waitOnWorkerPool(pool, abort)
+        self._runJobs(bake_ctx, jobs)
 
     def _handleDeletetions(self, record):
         for path, reason in record.getDeletions():
@@ -276,112 +279,67 @@ class Baker(object):
                 # by the user.
                 pass
 
-    def _createWorkerPool(self, record, pool_size=4):
+    def _createBakeContext(self, record):
         pool = []
-        queue = BakeScheduler(record)
-        abort = threading.Event()
-        for i in range(pool_size):
-            ctx = BakeWorkerContext(self.app, self.out_dir, self.force,
-                    record, queue, abort)
-            worker = BakeWorker(i, ctx)
-            pool.append(worker)
-        return pool, queue, abort
+        jobs = multiprocessing.Queue()
+        for i in range(self.num_workers):
+            results = multiprocessing.Queue()
+            commands = multiprocessing.Queue()
+            worker_ctx = BakeWorkerContext(
+                    i, self.app.root_dir, self.out_dir, record,
+                    jobs, results, commands,
+                    self.force)
+            proc = multiprocessing.Process(
+                    name=('baker-%d' % i),
+                    target=run_worker,
+                    args=(worker_ctx,))
+            pool.append((worker_ctx, proc))
 
-    def _waitOnWorkerPool(self, pool, abort):
-        for w in pool:
-            w.start()
-        for w in pool:
-            w.join()
-        if abort.is_set():
-            excs = [w.abort_exception for w in pool
-                    if w.abort_exception is not None]
-            logger.error("Baking was aborted due to %s error(s):" % len(excs))
-            if self.app.debug:
-                for e in excs:
-                    logger.exception(e)
-            else:
-                for e in excs:
-                    log_friendly_exception(logger, e)
-            raise BakingError("Baking was aborted due to errors.")
+        for worker_ctx, proc in pool:
+            proc.start()
 
+        bake_ctx = BakeContext(record, pool, jobs)
+        return bake_ctx
 
-class BakeWorkerContext(object):
-    def __init__(self, app, out_dir, force, record, work_queue,
-            abort_event):
-        self.app = app
-        self.out_dir = out_dir
-        self.force = force
-        self.record = record
-        self.work_queue = work_queue
-        self.abort_event = abort_event
+    def _runJobs(self, bake_ctx, jobs):
+        job_count = len(jobs)
+        logger.debug("Running %d jobs.", job_count)
+        for i, j in enumerate(jobs):
+            bake_ctx.jobs.put_nowait((i, j))
 
-
-class BakeWorkerJob(object):
-    def __init__(self, factory, route, record_entry,
-            taxonomy_name=None, taxonomy_term=None):
-        self.factory = factory
-        self.route = route
-        self.record_entry = record_entry
-        self.taxonomy_name = taxonomy_name
-        self.taxonomy_term = taxonomy_term
-
-    @property
-    def source(self):
-        return self.factory.source
-
-
-class BakeWorker(threading.Thread):
-    def __init__(self, wid, ctx):
-        super(BakeWorker, self).__init__(name=('worker%d' % wid))
-        self.wid = wid
-        self.ctx = ctx
-        self.abort_exception = None
-        self._page_baker = PageBaker(ctx.app, ctx.out_dir, ctx.force,
-                ctx.record)
-
-    def run(self):
-        while(not self.ctx.abort_event.is_set()):
-            try:
-                job = self.ctx.work_queue.getNextJob(wait_timeout=1)
-                if job is None:
-                    logger.debug("[%d] No more work... shutting down." %
-                            self.wid)
-                    break
-
-                self._unsafeRun(job)
-                logger.debug("[%d] Done with page." % self.wid)
-                self.ctx.work_queue.onJobFinished(job)
-            except Exception as ex:
-                self.ctx.abort_event.set()
-                self.abort_exception = ex
-                logger.debug("[%d] Critical error, aborting." % self.wid)
-                if self.ctx.app.debug:
-                    logger.exception(ex)
-                break
-
-    def _unsafeRun(self, job):
-        start_time = time.clock()
-
-        entry = job.record_entry
         try:
-            self._page_baker.bake(job.factory, job.route, entry,
-                    taxonomy_name=job.taxonomy_name,
-                    taxonomy_term=job.taxonomy_term)
-        except BakingError as ex:
-            logger.debug("Got baking error. Adding it to the record.")
-            while ex:
-                entry.errors.append(str(ex))
-                ex = ex.__cause__
+            result_count = 0
+            while result_count < job_count:
+                for c, p in bake_ctx.worker_pool:
+                    try:
+                        r = c.results.get_nowait()
+                        result_count += 1
+                        logger.debug("Got record for: %s:%s" %
+                                     (r.source_name, r.rel_path))
+                        bake_ctx.record.addEntry(r)
+                    except queue.Empty:
+                        pass
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            logger.debug("Got KeyboardInterrupt... terminating jobs.")
+            for proc in bake_ctx.worker_pool:
+                proc.terminate()
+            raise
+        logger.debug("Done running jobs.")
 
-        if entry.was_baked_successfully:
-            uri = entry.out_uris[0]
-            friendly_uri = uri if uri != '' else '[main page]'
-            friendly_count = ''
-            if entry.num_subs > 1:
-                friendly_count = ' (%d pages)' % entry.num_subs
-            logger.info(format_timed(start_time, '[%d] %s%s' %
-                    (self.wid, friendly_uri, friendly_count)))
-        elif entry.errors:
-            for e in entry.errors:
-                logger.error(e)
+
+class BakeContext(object):
+    def __init__(self, record, worker_pool, jobs):
+        self.record = record
+        self.worker_pool = worker_pool
+        self.jobs = jobs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        logger.debug("Terminating worker processes.")
+        for c, p in self.worker_pool:
+            p.terminate()
+        return False
 

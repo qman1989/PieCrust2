@@ -27,9 +27,8 @@ page_ref_pattern = re.compile(r'(?P<src>[\w]+)\:(?P<path>.*?)(;|$)')
 
 
 def build_pages(app, factories):
-    with app.env.page_repository.startBatchGet():
-        for f in factories:
-            yield f.buildPage()
+    for f in factories:
+        yield f.buildPage()
 
 
 class PageNotFoundError(Exception):

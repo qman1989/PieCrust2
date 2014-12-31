@@ -40,7 +40,6 @@ class BakeRecordPageEntry(object):
         self.source_name = factory.source.name
         self.taxonomy_name = taxonomy_name
         self.taxonomy_term = taxonomy_term
-        self.path_mtime = os.path.getmtime(factory.path)
 
         self.flags = FLAG_NONE
         self.config = None
@@ -62,11 +61,6 @@ class BakeRecordPageEntry(object):
     def num_subs(self):
         return len(self.out_paths)
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state['path_mtime']
-        return state
-
 
 class TransitionalBakeRecord(TransitionalRecord):
     def __init__(self, previous_path=None):
@@ -74,8 +68,9 @@ class TransitionalBakeRecord(TransitionalRecord):
                                                      previous_path)
 
     def addEntry(self, entry):
+        path_mtime = os.path.getmtime(entry.path)
         if (self.previous.bake_time and
-                entry.path_mtime >= self.previous.bake_time):
+                path_mtime >= self.previous.bake_time):
             entry.flags |= FLAG_SOURCE_MODIFIED
         super(TransitionalBakeRecord, self).addEntry(entry)
 

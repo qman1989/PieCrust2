@@ -1,8 +1,6 @@
 import os
 import os.path
-import codecs
 import logging
-import threading
 
 
 logger = logging.getLogger(__name__)
@@ -11,7 +9,6 @@ logger = logging.getLogger(__name__)
 class ExtensibleCache(object):
     def __init__(self, base_dir):
         self.base_dir = base_dir
-        self.lock = threading.Lock()
         self.caches = {}
 
     @property
@@ -21,15 +18,12 @@ class ExtensibleCache(object):
     def getCache(self, name):
         c = self.caches.get(name)
         if c is None:
-            with self.lock:
-                c = self.caches.get(name)
-                if c is None:
-                    c_dir = os.path.join(self.base_dir, name)
-                    if not os.path.isdir(c_dir):
-                        os.makedirs(c_dir, 0o755)
+            c_dir = os.path.join(self.base_dir, name)
+            if not os.path.isdir(c_dir):
+                os.makedirs(c_dir, 0o755)
 
-                    c = SimpleCache(c_dir)
-                    self.caches[name] = c
+            c = SimpleCache(c_dir)
+            self.caches[name] = c
         return c
 
     def getCacheDir(self, name):
@@ -73,7 +67,7 @@ class SimpleCache(object):
     def read(self, path):
         cache_path = self.getCachePath(path)
         logger.debug("Reading cache: %s" % cache_path)
-        with codecs.open(cache_path, 'r', 'utf-8') as fp:
+        with open(cache_path, 'r', encoding='utf8') as fp:
             return fp.read()
 
     def write(self, path, content):
@@ -82,7 +76,7 @@ class SimpleCache(object):
         if not os.path.isdir(cache_dir):
             os.makedirs(cache_dir, 0o755)
         logger.debug("Writing cache: %s" % cache_path)
-        with codecs.open(cache_path, 'w', 'utf-8') as fp:
+        with open(cache_path, 'w', encoding='utf8') as fp:
             fp.write(content)
 
     def getCachePath(self, path):
